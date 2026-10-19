@@ -102,7 +102,7 @@ class RuntimeConfig:
     model_dir: str = str(PP_MODEL_DIR)
     screen_w: int = 1280
     screen_h: int = 800
-    roi_confirm_seconds: float = 2.0
+    roi_confirm_seconds: float = 0.3
     roi_exit_grace: float = .8
     roi_boundary_grace: float = 14.0
     conf: float = .15
@@ -1895,8 +1895,7 @@ class StableCar:
                 self.roi_inside_hits = 0
             self.roi_last_inside_frame = frame_number
             self.roi_inside_hits += 1
-            elapsed = frame_number - self.roi_entry_frame
-            if elapsed >= round(args.roi_confirm_seconds * args.video_fps) and self.roi_inside_hits >= max(3, int(0.35 * args.roi_confirm_seconds * args.video_fps)):
+            if self.roi_inside_hits >= 3:
                 self.roi_ready = True
         elif frame_number - self.roi_last_inside_frame > grace:
             self.roi_ready = False
