@@ -1061,22 +1061,13 @@ def spatial_paint_candidates(crop, raw_scores=None, vehicle_class=2,
         return share, largest, clean
     for name, mask in masks.items():
         share, largest, clean = surface(mask, chroma_region)
-        # Bus bodies have large dark panels; a distinct painted stripe can be
-        # visually prominent although it occupies a small portion of the crop.
-        # Require a coherent colored region, not merely scattered lamp pixels.
         if share >= (.035 if bus else .16) and largest >= (.018 if bus else .075):
             strengths[name] = (share, largest)
     red_info = night_red_spatial_evidence(crop)
-    # A red-looking patch cannot become the second paint color until the
-    # independent body check accepts it. This also covers weak reflections
-    # that do not happen to trip the tail-dominant threshold.
     if not bus and not red_info['red_body_supported']:
         strengths.pop('red', None)
     neutral = valid & body & (sat <= (60 if bus else 32))
     if not bus:
-        # A road/background patch commonly connects two edges of the crop.
-        # Split by brightness first so dark trim cannot bridge gray road and
-        # white paint into a single component. The lower body avoids rear glass.
         for low, high in ((28, 125), (125, 195), (195, 246)):
             full = ((sat <= 32) & (value >= low) & (value < high)).astype(np.uint8)
             count, labels, stats, _ = cv2.connectedComponentsWithStats(full, 8)
@@ -1114,16 +1105,10 @@ def spatial_paint_candidates(crop, raw_scores=None, vehicle_class=2,
             return None
         dominant = dominant_body_paint(crop)
         if dominant and dominant['name'] in {first, second} and dominant['share'] >= .43:
-            # A saturated single-color car has neutral glass/roof. Require an
-            # unusually large, connected neutral panel before calling it paint.
-            # This rule applies to ALL chromatic colors, not just red.
             if (strengths[neutral_name][0] < .42 or
                     strengths[neutral_name][1] < .32):
                 return None
     total = strengths[first][0] + strengths[second][0]
-    # A secondary color must be conspicuous, not merely a tiny lamp, roof
-    # highlight or patch of background. Ratios below are observed crop cues,
-    # not claimed proportions of the actual car paint.
     secondary_ratio = strengths[second][0] / max(total, 1e-6)
     required_share = min(min_share, .05) if bus else max(min_share, .20)
     required_patch = .018 if bus else .085
@@ -1296,9 +1281,6 @@ def diffuse_cast_scores(crop, classifier, args, evidence):
             and consensus[index]-float(np.max(runners)) >= .10):
         consensus[COLOR_NAMES.index('red')] = 0.
         return consensus
-    # A few pixels of bbox padding can make this model alternate between
-    # brown and black. Check two other insets only for that chromatic/neutral
-    # disagreement, never to resolve an ambiguous black/gray/white pair.
     neutral = {'black','gray','white'}
     first,second = candidate,COLOR_NAMES[int(np.argmax(inner_scores))]
     conflicting_neutrals = first in neutral and second in neutral and first != second
@@ -1385,8 +1367,6 @@ def night_color_scores(crop, scores, classifier, args, allow_alternate=True):
     if (support >= max(.60,args.night_alt_conf) and supported
             and j == int(np.argmax(a)) and j == int(np.argmax(b))):
         return (np.clip(consensus, 0.0, 1.0).astype(np.float32), 'alternate_supported')
-    # HSV desaturation retaining max(R,G,B) brightens a red-lit black body.
-    # Reject unsupported alternatives instead of manufacturing a gray vote.
     return (np.zeros(10, dtype=np.float32), 'red_uncertain')
 
 
@@ -1533,7 +1513,6 @@ class SceneLightShiftGuard:
         small = cv2.resize(frame, (192, 108), interpolation=cv2.INTER_AREA)
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         hh, ss, vv = cv2.split(hsv)
-        # The band includes both green traffic signals and blue/teal spill.
         chroma = ((hh >= 35) & (hh < 140) & (ss >= 58)
                   & (vv >= 40) & (vv < 250))
         return np.array([
@@ -1553,8 +1532,6 @@ class SceneLightShiftGuard:
         shifted = adjacent and float(np.mean(delta)) >= .055
         self.consecutive = min(8, self.consecutive + 1) if shifted else max(0, self.consecutive - 1)
         self.active = self.consecutive >= 2 or (self.active and self.consecutive > 0)
-        # Learn the scene's normal color distribution slowly, but never learn
-        # away an active color cast (which can persist for several seconds).
         if not self.active and not shifted:
             self.reference = .995 * self.reference + .005 * current
         return self.active
@@ -1634,7 +1611,6 @@ class TrackColorState:
 
     def update(self, crop, classifier, frame_number, args):
         self.observation_attempts += 1
-        # Một khoảng mất dấu dài không được nối thành chuỗi xác nhận liên tục.
         if self.last_frame is not None and frame_number-self.last_frame > max(3, round(getattr(args, 'video_fps', 25.))):
             self.votes.clear()
             self.pair_red_refutations.clear()
@@ -1659,17 +1635,10 @@ class TrackColorState:
                 self.vehicle_class = 2
             elif (len(self.bus_type_votes) >= 4 and
                   sum(self.bus_type_votes) >= .75*len(self.bus_type_votes)):
-                # YOLO sometimes emits car/truck for a coach. Use repeated PP
-                # *vehicle type* observations to choose coach paint geometry.
                 self.vehicle_class = 5
         else:
             raw = classifier.predict_proba(crop)
         raw = validated_scores(raw)
-        # Đèn hậu có thể sáng suốt đoạn video: KHÔNG gọi nó là màu sơn.
-        # Nếu đã có nhãn ổn định thì giữ nhãn, không thêm các phiếu sai.
-        # Nếu chưa có nhãn, chỉ thử một nhãn trung tính khi classifier trên
-        # cả ảnh đã giảm ám đỏ và ảnh thân xe đều đồng thuận. Nếu thiếu bằng
-        # chứng vẫn để CHƯA RÕ thay vì đoán theo ánh đèn.
         if red_floodlight_observation(crop):
             if self.paint_pair_confirmed and self.vehicle_class != 5:
                 evidence = night_red_spatial_evidence(crop)
@@ -1709,8 +1678,6 @@ class TrackColorState:
         white_body = strong_neutral_body_paint(crop)
         clear = (context.weight >= .65 and context.median_value >= 60
                  and context.clipped_share < .10 and context.headlight_share < .09)
-        # Chỉ bổ sung màu thân khi model cũng có bằng chứng cho chính màu đó.
-        # Không đổi xe đen sang xanh chỉ vì nền/kính bị ám xanh nhạt.
         if body and clear and body['name'] not in assessment.blocked_colors:
             name = body['name'];index = COLOR_NAMES.index(name)
             if body['share'] >= .43 and raw[index] >= max(.65, args.color_conf):
@@ -1719,8 +1686,6 @@ class TrackColorState:
                 verified = (body['share'] >= .48 and
                             (name != 'red' or assessment.red_body_supported))
                 self.status = 'body_model_supported'
-        # Thân trắng lớn trên ảnh gốc có thể sửa xám ban đầu, kể cả khi đèn
-        # phanh làm model toàn xe thiên đỏ. Không dùng frame bị cháy sáng nặng.
         white_index = COLOR_NAMES.index('white')
         white_supported = (args.white_gray_assist and white_body is not None and clear
                             and (raw[white_index] >= .20 and white_index in np.argsort(raw)[-2:]
@@ -1734,9 +1699,6 @@ class TrackColorState:
             self.status = 'white_body_supported'
         pair = None
         if args.two_colors and clear and context.clipped_share < .08:
-            # On a large coach, PP's full-image color score may be diluted by
-            # windows and lamps despite two substantial visible paint regions.
-            # The coach geometry still has to prove BOTH regions spatially.
             minimum_pair_model_score = (min(args.two_color_conf, .40)
                                         if self.vehicle_class == 5
                                         else args.two_color_conf)
@@ -1744,12 +1706,6 @@ class TrackColorState:
                                             args.second_share, minimum_pair_model_score)
         if pair is not None and not red_floodlight_observation(crop):
             denied = set(pair) & set(assessment.blocked_colors)
-            # PP-Vehicle can classify the whole bus as RED because of lamps,
-            # causing night_color_scores() to zero ALL ten scores. That result
-            # must not delete independent evidence of two painted regions.
-            # Recovery is deliberately narrow: confirmed coach geometry, two
-            # coherent image regions, no diffuse red flood and non-lamp red
-            # evidence on the body. Never rescue a tiny taillight patch.
             separate_paint = (
                 self.vehicle_class == 5
                 and denied == {'red'}
@@ -1760,14 +1716,9 @@ class TrackColorState:
             )
             if not denied or separate_paint:
                 colors = pair
-                # PP scores describe the vehicle as a whole, not the area of
-                # each painted region; use them only as image-level support.
                 confidence = max(float(raw[COLOR_NAMES.index(name)]) for name in pair)
                 verified = True
                 self.status = 'two_paint_regions' if not denied else 'two_paint_lamp_recovery'
-        # Khi đèn tín hiệu làm cả cảnh đổi sắc xanh, không thêm nhãn XANH mới
-        # vào xe đã xác nhận màu trước đó. Đây là chốt bảo vệ hẹp, KHÔNG sửa
-        # điểm PP-Vehicle và KHÔNG thay quy tắc nhận hai màu gốc.
         if (colors is not None and self.label_confirmed
                 and getattr(args, 'scene_green_shift', False)):
             previous = set(self.color.split(' và '))
@@ -1775,14 +1726,10 @@ class TrackColorState:
             introduced = suggested - previous
             if introduced & {COLOR_VI['green'], COLOR_VI['blue']}:
                 colors = None
-        # Mỗi quan sát, kể cả lượt bị loại, đều làm cửa sổ tiến lên.
-        # Nhãn cũ vẫn hiển thị khi thiếu bằng chứng, nhưng không tự thêm phiếu.
         if assessment.status in {'underexposed', 'overexposed'}:
             colors = None
         old = frozenset(self.color.split(' và ')) if self.label_confirmed else frozenset()
         proposed = frozenset(COLOR_VI[name] for name in colors) if colors else frozenset()
-        # Keep testing a saved neutral/red pair even when the regular vote is
-        # held. A red light cannot indefinitely preserve a false red label.
         if self.paint_pair_confirmed:
             if self._consider_red_pair_refutation(
                     night_red_spatial_evidence(crop), context,
@@ -1792,8 +1739,6 @@ class TrackColorState:
         corrected = assessment.status in {'reflection_corrected', 'alternate_supported', 'headlights_corrected'}
         neutral_labels = {COLOR_VI[name] for name in ('black', 'gray', 'white')}
         if old and proposed != old and colors:
-            # Ảnh sửa phản chiếu không tự đổi trắng/xám/đen đã biết. Bằng chứng
-            # thân trắng độc lập vẫn được xét để sửa một nhãn ban đầu sai.
             if corrected and not white_supported and (
                     old <= neutral_labels and proposed <= neutral_labels
                     or self.label_paint_verified):
@@ -1804,8 +1749,6 @@ class TrackColorState:
                 evidence = night_red_spatial_evidence(crop)
                 if evidence['lamp_share'] >= .003 and evidence['strong_red_middle'] < .28:
                     colors = None
-            # Sơn xe khách chỉ thấy một mảng hoặc bị ám đèn không xóa cặp đã
-            # xác nhận. Một thân đơn sắc rõ, phủ rộng vẫn sửa được cặp sai.
             if colors and self.paint_pair_confirmed and len(colors) == 1:
                 single_clear = ((body and body['name'] == colors[0]
                                  and body['share'] >= (.80 if self.vehicle_class == 5 else .43)
@@ -2018,8 +1961,6 @@ class StableCar:
         self.class_history.append(detection['class_id'])
         bus_hits = self.class_history.count(5)
         car_hits = self.class_history.count(2)
-        # One erroneous YOLO bus detection must not enable bus paint geometry
-        # on an SUV. PP-Vehicle's SUV output is reused from the color inference.
         if (bus_hits >= 3 and bus_hits >= .60*(bus_hits + car_hits)
                 and not self.color_state.verified_suv):
             self.color_state.vehicle_class = 5
@@ -2105,8 +2046,6 @@ class CarTrackManager:
         detected_ids = {det['raw_id'] for det in detections if det['raw_id'] is not None}
         if self.prev_gray is not None:
             for car in self.cars.values():
-                # ByteTrack has already located these cars in the current frame.
-                # KLT is needed for missing IDs and association after an ID change.
                 if car.raw_id is None or car.raw_id not in detected_ids:
                     car.advance_flow(self.prev_gray, gray, frame_number, args)
         self.prev_gray = gray
