@@ -75,6 +75,7 @@ ConvertTo-Json -InputObject $texts -Compress
 PROJECT_ROOT = Path(__file__).resolve().parent
 DETECTION_MODEL = str(PROJECT_ROOT / 'yolo11s.pt')
 PP_MODEL_DIR = PROJECT_ROOT / 'models' / 'pp_vehicle_attribute'
+LOGO_MODEL = str(PROJECT_ROOT / 'models' / 'vehicle_logo' / 'best.pt')
 COLOR_NAMES = ['yellow', 'orange', 'green', 'gray', 'red', 'blue', 'white', 'golden', 'brown', 'black']
 VEHICLE_TYPE_NAMES = ['sedan', 'suv', 'van', 'hatchback', 'mpv', 'pickup', 'bus', 'truck', 'estate']
 PASSENGER_TYPES = {'sedan', 'suv', 'hatchback', 'mpv', 'estate'}
@@ -100,6 +101,15 @@ class RuntimeConfig:
 
     model: str = DETECTION_MODEL
     model_dir: str = str(PP_MODEL_DIR)
+    # Mặc định tự nhận diện hãng khi chạy lệnh cũ: python car_color.py --source video.mp4
+    logo_model: str = LOGO_MODEL
+    no_logo: bool = False
+    logo_conf: float = .45
+    logo_every: int = 5
+    logo_every_confirmed: int = 25
+    logo_min_side: int = 48
+    logo_min_samples: int = 3
+    logo_vote_window: int = 7
     screen_w: int = 1280
     screen_h: int = 800
     roi_confirm_seconds: float = 0.3
@@ -168,11 +178,12 @@ def clip_box(box, width, height):
     x2, y2 = (max(x1 + 1, min(x2, width)), max(y1 + 1, min(y2, height)))
     return (x1, y1, x2, y2)
 
-def format_vehicle_label(car_id, detection_conf, color):
-    """ID ít nhất 2 chữ số; Conf YOLO theo %, ví dụ 0.89 -> 089."""
+def format_vehicle_label(car_id, detection_conf, color, logo=None, show_logo=True):
+    """Conf vẫn là độ tin cậy YOLO phát hiện xe, không phải độ tin cậy màu/logo."""
     confidence = int(round(float(np.clip(detection_conf, 0.0, 1.0)) * 100))
     color_label = ' và '.join((part.capitalize() for part in color.split(' và ')))
-    return f"ID:{int(car_id):02d}-Conf:{confidence:03d}-{color_label}"
+    brand_text = f"-{logo or 'Chưa rõ'}" if show_logo else ''
+    return f"ID:{int(car_id):02d}-Conf:{confidence:03d}{brand_text}-{color_label}"
 
 def argsafe_hold(fps):
     return max(1, int(round(0.22 * fps)))
@@ -652,6 +663,134 @@ class PPVehicleColorClassifier:
     def predict_type_proba(self, crop_bgr):
         return self.predict_attributes(crop_bgr)[1]
 
+
+
+# --- MODEL NHAN DIEN LOGO / HANG XE ---
+
+def standard_brand_name(class_name):
+    """Không chấp nhận các nhãn chung ('object', 'logo', 'car') là tên hãng."""
+    name = re.sub(r'[_-]+', ' ', str(class_name)).strip()
+    name = re.sub(r'\s+', ' ', name)
+    low = name.casefold()
+    if low.startswith('logo '):
+        low = low[5:].strip()
+    if low.endswith(' logo'):
+        low = low[:-5].strip()
+    invalid = {'object', 'objects', 'logo', 'car', 'cars', 'vehicle',
+               'car brand', 'brand', 'emblem', 'symbol', 'other', 'unknown',
+               'background', 'none', 'no logo', 'no brand', 'unlabeled'}
+    if not low or low in invalid or low.isdecimal():
+        return None
+    well_known = {
+        'vinfast': 'VinFast', 'vin fast': 'VinFast',
+        'mercedes': 'Mercedes-Benz', 'mercedes benz': 'Mercedes-Benz',
+        'mescedes': 'Mercedes-Benz', 'mescedes benz': 'Mercedes-Benz',
+        'bmw': 'BMW', 'audi': 'Audi', 'kia': 'Kia',
+        'vw': 'Volkswagen', 'land rover': 'Land Rover',
+        'hyundai': 'Hyundai', 'toyota': 'Toyota', 'honda': 'Honda',
+    }
+    return well_known.get(low, ' '.join(x.upper() if len(x) <= 2 else x.title()
+                                    for x in low.split()))
+
+
+class VehicleLogoRecognizer:
+    """Dùng trọng số YOLO detect logo cục bộ, không gửi ảnh lên Roboflow/API."""
+
+    def __init__(self, model_path, confidence=.45):
+        path = Path(model_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Không tìm thấy model logo: {path}")
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError('Thiếu ultralytics. Cài: python -m pip install ultralytics') from exc
+        try:
+            self.model = YOLO(str(path))
+        except Exception as exc:
+            raise RuntimeError(f"Không nạp được model logo '{path}': {exc}") from exc
+        if str(getattr(self.model, 'task', '')).lower() != 'detect':
+            raise RuntimeError('best.pt nhận diện logo cần có task=detect; kiểm tra đúng trọng số.')
+        names = getattr(self.model, 'names', {})
+        if isinstance(names, dict):
+            raw_names = names.values()
+        elif isinstance(names, (list, tuple)):
+            raw_names = names
+        else:
+            raw_names = []
+        valid = sorted({brand for label in raw_names
+                        if (brand := standard_brand_name(label)) is not None})
+        if not valid:
+            raise RuntimeError('best.pt không có class tên hãng hợp lệ; có thể đã nạp nhầm model.')
+        self.confidence = float(confidence)
+        print(f"[READY] YOLO logo: {path} | {len(valid)} hãng: {', '.join(valid)}")
+
+    def predict(self, vehicle_crop):
+        """Trả về (hãng, điểm logo) hoặc None; các boxes nằm trong ảnh xe đã cắt."""
+        if vehicle_crop is None or vehicle_crop.size == 0:
+            return None
+        result = self.model.predict(
+            source=vehicle_crop, imgsz=640, verbose=False,
+            conf=min(self.confidence, .25))[0]
+        boxes = getattr(result, 'boxes', None)
+        if boxes is None or boxes.conf is None or len(boxes) == 0:
+            return None
+        scores = boxes.conf.cpu().numpy()
+        class_ids = boxes.cls.cpu().numpy().astype(int)
+        coords = boxes.xyxy.cpu().numpy()
+        names = getattr(result, 'names', None) or self.model.names
+        height, width = vehicle_crop.shape[:2]
+        choice = None
+        for score, class_id, box in zip(scores, class_ids, coords):
+            score = float(score)
+            if not np.isfinite(score) or score < self.confidence:
+                continue
+            raw_name = (names.get(int(class_id), names.get(str(int(class_id)), ''))
+                        if isinstance(names, dict)
+                        else (names[int(class_id)] if 0 <= int(class_id) < len(names) else ''))
+            brand = standard_brand_name(raw_name)
+            if brand is None:
+                continue
+            x1, y1, x2, y2 = [float(value) for value in box]
+            if not all(np.isfinite(v) for v in (x1, y1, x2, y2)):
+                continue
+            box_w, box_h = x2 - x1, y2 - y1
+            if box_w < 2 or box_h < 2:
+                continue
+            # Logo phải là vùng nhỏ trong ảnh xe, không phải box bao toàn xe.
+            if box_w * box_h > .50 * width * height:
+                continue
+            if choice is None or score > choice[1]:
+                choice = (brand, score)
+        return choice
+
+
+class TrackLogoState:
+    """Giữ một nhãn hãng ổn định trên ID; tách biệt hoàn toàn với voting màu."""
+
+    def __init__(self, args):
+        self.logo = None
+        self.confidence = 0.0
+        self.votes = deque(maxlen=max(args.logo_vote_window, args.logo_min_samples + 2))
+        self.last_attempt_hit = -10**8
+
+    def update(self, crop, recognizer, args):
+        self.votes.append(recognizer.predict(crop))
+        valid = [vote for vote in self.votes if vote is not None]
+        if len(valid) < args.logo_min_samples:
+            return
+        counts = {}
+        for name, score in valid:
+            values = counts.setdefault(name, [])
+            values.append(float(score))
+        # Dùng số lần quan sát trước, điểm tin cậy trung bình để phân xử hòa.
+        name, matches = max(counts.items(), key=lambda item:
+                            (len(item[1]), np.mean(item[1])))
+        threshold = args.logo_min_samples if self.logo is None else max(4, args.logo_min_samples)
+        agreement = len(matches) / len(valid)
+        required_agreement = .67 if self.logo is None else .80
+        if len(matches) >= threshold and agreement >= required_agreement:
+            self.logo = name
+            self.confidence = float(np.median(matches))
 
 # --- BANG CHUNG THAN XE / DEN ---
 
@@ -1808,6 +1947,7 @@ class StableCar:
         self.confirmed = False
         self.in_roi = bool(detection.get('in_roi', True))
         self.color_state = TrackColorState(car_id, args)
+        self.logo_state = TrackLogoState(args)
         self.class_history = deque(maxlen=15)
         self.roi_entry_frame = frame_number if self.in_roi else None
         self.roi_last_inside_frame = frame_number if self.in_roi else -10 ** 8
@@ -1821,6 +1961,10 @@ class StableCar:
     @property
     def color(self):
         return self.color_state.color
+
+    @property
+    def logo(self):
+        return self.logo_state.logo
 
     def predicted_box(self, frame_number, fps):
         dt = max(0, frame_number - self.last_frame)
@@ -1932,7 +2076,7 @@ class StableCar:
         score -= 0.022 * age
         return score if score >= 0.9 else None
 
-    def update(self, detection, frame, frame_number, classifier, args, gray=None):
+    def update(self, detection, frame, frame_number, classifier, args, gray=None, logo_recognizer=None):
         raw = np.asarray(detection['box'], dtype=np.float32)
         dt = max(1, frame_number - self.last_frame)
         pred_before = self.predicted_box(frame_number, args.video_fps)
@@ -1966,18 +2110,29 @@ class StableCar:
         self.confirmed = self.confirmed or self.hits >= args.min_hits
         if not self.in_roi:
             return
-        interval = (args.color_every_confirmed
-                    if self.color_state.label_confirmed else args.color_every)
-        if classifier is None or (self.hits - 1) % interval != 0:
+        # Màu và logo chạy độc lập; không bỏ qua logo khi màu đã có nhãn.
+        color_interval = (args.color_every_confirmed
+                          if self.color_state.label_confirmed else args.color_every)
+        run_color = (classifier is not None
+                     and (self.hits - 1) % color_interval == 0)
+        logo_interval = (args.logo_every_confirmed if self.logo_state.logo
+                         else args.logo_every)
+        run_logo = (logo_recognizer is not None
+                    and self.hits - self.logo_state.last_attempt_hit >= logo_interval)
+        if not (run_color or run_logo):
             return
         x1, y1, x2, y2 = clip_box(raw, frame.shape[1], frame.shape[0])
         crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or min(crop.shape[:2]) < args.min_color_side:
+        if crop.size == 0:
             return
         if not color_crop_is_complete((x1, y1, x2, y2), frame.shape):
             self.color_state.status = 'partial_vehicle'
             return
-        self.color_state.update(crop, classifier, frame_number, args)
+        if run_logo and min(crop.shape[:2]) >= args.logo_min_side:
+            self.logo_state.last_attempt_hit = self.hits
+            self.logo_state.update(crop, logo_recognizer, args)
+        if run_color and min(crop.shape[:2]) >= args.min_color_side:
+            self.color_state.update(crop, classifier, frame_number, args)
 
     def annotated(self, frame_number, args, fps, roi_polygon=None):
         age = frame_number - self.last_frame
@@ -1994,7 +2149,8 @@ class StableCar:
         if roi_polygon is not None:
             if vehicle_roi_signed_distance(box, roi_polygon) < -args.roi_boundary_grace:
                 return None
-        text = format_vehicle_label(self.id, self.conf, self.color)
+        text = format_vehicle_label(self.id, self.conf, self.color,
+                                    self.logo, show_logo=not args.no_logo)
         return (box, text, age > 0)
 
 class CarTrackManager:
@@ -2039,7 +2195,7 @@ class CarTrackManager:
         self.type_cache.append({'frame': frame_number, 'raw_id': det['raw_id'], 'box': box, 'accept': accept})
         return accept
 
-    def step(self, detections, frame_number, frame, classifier):
+    def step(self, detections, frame_number, frame, classifier, logo_recognizer=None):
         args = self.args
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         detected_ids = {det['raw_id'] for det in detections if det['raw_id'] is not None}
@@ -2063,7 +2219,8 @@ class CarTrackManager:
             used_dets.add(di)
             used_cars.add(car_id)
             car = self.cars[car_id]
-            car.update(detections[di], frame, frame_number, classifier, args, gray)
+            car.update(detections[di], frame, frame_number, classifier, args, gray,
+                       logo_recognizer=logo_recognizer)
         for di, det in enumerate(detections):
             if di in used_dets:
                 continue
@@ -2080,7 +2237,8 @@ class CarTrackManager:
             car = StableCar(self.next_id, det, frame_number, args)
             self.cars[self.next_id] = car
             self.next_id += 1
-            car.update(det, frame, frame_number, classifier, args)
+            car.update(det, frame, frame_number, classifier, args,
+                       logo_recognizer=logo_recognizer)
         expired = [cid for cid, car in self.cars.items() if frame_number - car.last_frame > args.reid_frames]
         for cid in expired:
             del self.cars[cid]
@@ -2095,7 +2253,7 @@ class CarTrackManager:
 # --- VE NHAN ---
 
 def annotate_frame(frame_bgr, annotations, render_width=1280):
-    """Vẽ nhãn ID:01-Conf:089-Màu; xếp nhãn tránh va chạm và tràn ảnh."""
+    """Vẽ ID / confidence phát hiện / hãng / màu; tránh trùng nhãn."""
     h, w = frame_bgr.shape[:2]
     if render_width > 0 and w > render_width:
         new_h = max(2, round(h * render_width / w))
@@ -2164,8 +2322,13 @@ def color_crop_is_complete(box, shape):
     return not (at_edge and y2-y1 < .75*(x2-x1))
 
 
-def run(args, detector=None, classifier=None):
-    """Chạy nhận diện màu từng frame; điều phối ROI, YOLO, tracker và MP4."""
+def run(args, detector=None, classifier=None, logo_recognizer=None):
+    """Chạy màu và logo theo ID; mặc định tự nạp models/vehicle_logo/best.pt."""
+    if not args.no_logo and logo_recognizer is None and not Path(args.logo_model).is_file():
+        raise FileNotFoundError(
+            f"Không tìm thấy trọng số logo tại: {args.logo_model}\n"
+            "Hãy đặt best.pt vào models/vehicle_logo/best.pt. "
+            "Nếu muốn chạy chỉ nhận diện màu như trước, thêm --no-logo.")
     source = int(args.source) if str(args.source).isdigit() else args.source
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -2206,6 +2369,8 @@ def run(args, detector=None, classifier=None):
             detector = YOLO(args.model)
         if classifier is None:
             classifier = PPVehicleColorClassifier(args.model_dir, args.paddle_device)
+        if not args.no_logo and logo_recognizer is None:
+            logo_recognizer = VehicleLogoRecognizer(args.logo_model, args.logo_conf)
     except Exception:
         cap.release()
         raise
@@ -2219,7 +2384,7 @@ def run(args, detector=None, classifier=None):
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Không ghi được MP4: {output}")
-    preview_window = 'Nhan dien mau o to | Q: dung'
+    preview_window = 'Nhan dien mau va logo xe | Q: dung'
     show = not args.no_show
     if show:
         try:
@@ -2244,6 +2409,8 @@ def run(args, detector=None, classifier=None):
                   f"{search_x2-search_x1}x{search_y2-search_y1}")
     print(f"[INFO] Màu: {('tối đa 2 màu' if args.two_colors else '1 màu chính')} | SUV rescue: {('ON' if args.recover_suv else 'OFF')}")
     print('[INFO] Màu từ model và vùng thân; xác nhận qua nhiều lượt quan sát theo ID.')
+    if logo_recognizer is not None and not args.no_logo:
+        print('[INFO] Logo: YOLO offline trên crop xe; voting riêng theo ID; không đổi lệnh chạy.')
     print(f"[INFO] Video kết quả: {output}")
     try:
         while True:
@@ -2287,7 +2454,8 @@ def run(args, detector=None, classifier=None):
                         continue
                     detections.append({'box': box, 'conf': float(confidence), 'class_id': int(class_id), 'raw_id': int(track_ids[index]) if track_ids is not None else None, 'appearance': appearance_signature(crop), 'in_roi': point_in_vehicle_roi(box, roi_polygon)})
             detections = deduplicate_detections(detections)
-            annotations = manager.step(detections, frame_no, frame, classifier)
+            annotations = manager.step(detections, frame_no, frame, classifier,
+                                       logo_recognizer if not args.no_logo else None)
             rendered = annotate_frame(frame, annotations, args.render_width)
             if rendered.shape[:2] != (render_height, render_width):
                 rendered = cv2.resize(rendered, output_size, interpolation=cv2.INTER_AREA)
@@ -2317,10 +2485,16 @@ def run(args, detector=None, classifier=None):
 def parse_args(argv=None):
     """Chỉ nhận các tùy chọn cần thiết khi vận hành hệ thống."""
     parser = argparse.ArgumentParser(
-        description='Nhận dạng màu ô tô/xe khách bằng YOLO11 và PP-Vehicle',
+        description='Nhận dạng màu và logo hãng ô tô/xe khách bằng YOLO11 và PP-Vehicle',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--source', required=True, help='Video, RTSP hoặc webcam 0')
     parser.add_argument('--output', help='MP4 kết quả; bỏ trống để tự đặt tên')
+    parser.add_argument('--logo-model', default=LOGO_MODEL,
+                        help='Trọng số YOLO logo; mặc định models/vehicle_logo/best.pt')
+    parser.add_argument('--no-logo', action='store_true',
+                        help='Chỉ chạy nhận diện màu (không tải model logo)')
+    parser.add_argument('--logo-conf', type=float, default=.45,
+                        help='Độ tin cậy tối thiểu của logo hãng xe')
     parser.add_argument('--paddle-device', choices=('auto', 'cpu', 'gpu'),
                         default='auto', help='Tự dùng GPU khi Paddle hỗ trợ')
     parser.add_argument('--render-width', type=int, default=1280,
@@ -2341,6 +2515,8 @@ def parse_args(argv=None):
     values = parser.parse_args(argv)
     if values.render_width < 320:
         parser.error('--render-width phải từ 320 trở lên')
+    if not 0 < values.logo_conf <= 1:
+        parser.error('--logo-conf cần nằm trong khoảng (0, 1]')
     if values.no_roi and values.redraw_roi:
         parser.error('--no-roi không thể đi cùng --redraw-roi')
     if values.clock_box:
